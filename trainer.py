@@ -1,0 +1,291 @@
+import copy
+import sys
+
+import torch
+from alive_progress import alive_bar
+
+# from models.GNNNeighborExtractor import NeighborExtractor2, NeighborExtractor3, OptimizedNeighborExtractor
+from utils.plots import plot_tsne
+from utils.util import save_checkpoint_scheduler, time_logger
+from wandb_wrapper import wandb
+
+
+class OptimizedNeighborExtractor:
+    def __init__(self, max_num_neighbors):
+        self.max_num_neighbors = max_num_neighbors  # 每个节点最多的邻居数目
+
+    def get_neighbor_tensor(self, edge_index, graph_emb):
+        num_nodes = graph_emb.size(0)
+        max_num_neighbors = self.max_num_neighbors
+        embedding_dim = graph_emb.size(1)
+
+        # 创建邻居特征张量，初始化为节点本身的特征
+        neighbor_features = torch.repeat_interleave(graph_emb.unsqueeze(1), max_num_neighbors, dim=1).to(
+            graph_emb.device)
+        neighbor_mask = torch.zeros(num_nodes, max_num_neighbors, dtype=torch.int).to(graph_emb.device)
+
+        # 为每个节点的第一个位置填充自身特征
+        neighbor_mask[:, 0] = 1  # 标记节点自身为有效邻居
+
+        # 获取边的源节点和目标节点
+        src_nodes, dst_nodes = edge_index[0], edge_index[1]
+
+        # 使用矢量化操作批量填充邻居特征
+        for src_node, dst_node in zip(src_nodes, dst_nodes):
+            self._fill_neighbors(src_node, dst_node, graph_emb, neighbor_features, neighbor_mask, num_nodes)
+
+        return neighbor_features, neighbor_mask
+
+    def _fill_neighbors(self, src_node, dst_node, graph_emb, neighbor_features, neighbor_mask, num_nodes):
+
+        # Ensure that the node index is valid (within the range of num_nodes)
+        if src_node >= num_nodes or dst_node >= num_nodes:
+            return  # Skip invalid nodes
+
+        # 为源节点和目标节点填充邻居特征
+        for node, neighbor in [(src_node, dst_node), (dst_node, src_node)]:
+            if node >= num_nodes:  # Ensure that node index does not exceed the number of nodes
+                continue  # Skip invalid nodes
+            for j in range(1, self.max_num_neighbors):
+                if neighbor_mask[node, j] == 0:  # 确保索引不会超出范围
+                    # if neighbor_mask[node, j] == 0:  # 找到空闲位置
+
+                    neighbor_features[node, j] = graph_emb[neighbor]
+
+                    neighbor_mask[node, j] = 1  # 标记该位置为有效
+                    break
+
+
+class Trainer:
+    def __init__(self, model, optimizer, scheduler, args):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.args = args
+        self.accumulation_steps = args.accumulation_steps
+        self.device = args.device
+        self.best_model_state = None  # 用于保存最好模型的权重
+        self.neighbor_extractor = OptimizedNeighborExtractor(max_num_neighbors=args.max_neighbors)
+
+    @time_logger
+    def train_one_epoch(self, graph, train_loader):
+        self.model.train()
+        epoch_total_loss = 0.0
+        # total_loss = 0
+        total_fuse_loss = 0
+        total_text_loss = 0
+        total_graph_loss = 0
+        total_contra_loss = 0
+        accumulation_steps = self.args.accumulation_steps  # Number of batches to accumulate gradients over
+        self.optimizer.zero_grad()
+        num_batches = len(train_loader)
+        loss = torch.tensor(0.0)
+        # print(f"graph:{graph}")
+        for batch_idx, batch in enumerate(train_loader):
+            # print(f"batch_idx:{batch_idx}, batch:{batch}")
+            for s in ["x", "y", "edge_index", "input_ids", "attention_mask"]:
+                batch[s] = batch[s].to(self.device)
+            batch_size = batch['batch_size']
+
+            fuse_logits, text_logits, graph_logits, logits_ensemb, text_emb, graph_emb, fuse_emb, fuse_emb2, token_emb = self.model(
+                batch_size=batch_size, x=batch["x"], edge_index=batch["edge_index"],
+                text_input=batch["input_ids"][:batch_size], attention_mask=batch["attention_mask"][:batch_size])
+            # print(batch)
+            batch_neighbors_features, batch_neighbors_mask = self.neighbor_extractor.get_neighbor_tensor(
+                batch["edge_index"], graph_emb)
+
+            loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits, text_logits,
+                graph_logits, batch["y"][:batch_size], text_emb, graph_emb, batch_neighbors_features, token_emb,
+                batch_neighbors_mask, batch["attention_mask"][:batch_size])
+            # out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
+            # y = batch.y[:batch.batch_size].squeeze()
+            # loss = F.cross_entropy(out, y)
+            # loss, fuse_loss, text_loss, graph_loss, contra_loss =  self.model.get_loss2(fuse_logits=fuse_logits, text_logits=text_logits, graph_logits=graph_logits, labels=batch.y[:batch_size], text_emb=text_emb, graph_emb=graph_emb, edge_index=batch.edge_index, token_emb=token_emb, attention_mask=batch["attention_mask"][:batch.batch_size], if_contrast_loss=True)
+
+            loss = loss / accumulation_steps
+            loss.backward()
+
+            if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(train_loader)):
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+
+            # Accumulate loss for logging
+            epoch_total_loss += loss.item()
+            total_fuse_loss += fuse_loss
+            total_text_loss += text_loss
+            total_graph_loss += graph_loss
+            total_contra_loss += contra_loss
+        # logs = {'total_loss': epoch_total_loss / num_batches, 'fuse_loss': total_fuse_loss / num_batches,
+        #         'text_loss': total_text_loss / num_batches, 'graph_loss': total_graph_loss / num_batches,
+        #         'contra_loss': total_contra_loss / num_batches}
+        # return logs
+        # print(f"epoch_total_loss")
+        return epoch_total_loss / num_batches
+
+    # @time_logger
+    def fit(self, graph, evaluator, train_loader, bert_infer_loader, split_idx):
+        start_epoch = 0
+        patience_counter = 0
+        best_valid_loss = sys.float_info.max
+        self.args.saveq=0
+
+        # 加载 checkpoint
+        # if os.path.exists(self.args.checkpoint_path):
+        #     logging.info(f"Loading checkpoint from {self.args.checkpoint_path}")
+        #
+        #     # start_epoch, _, best_valid_loss = load_checkpoint_2(self.model, self.optimizer, None, self.args.checkpoint_path)
+        #     self.best_model_state = copy.deepcopy(self.model.state_dict())
+
+        # # # 继续训练
+        # if os.path.exists(self.args.checkpoint_path):
+        #     logging.info(f"Loading checkpoint from {self.args.checkpoint_path}, start_epoch:{start_epoch}, best_valid_loss:{best_valid_loss}")
+        #     start_epoch, _, best_valid_loss = load_checkpoint_scheduler(self.model, self.optimizer, None,
+        #         self.args.checkpoint_path, scheduler=self.scheduler)
+        #     self.best_model_state = copy.deepcopy(self.model.state_dict())
+
+        with alive_bar(self.args.epochs) as bar:
+            for epoch in range(start_epoch, self.args.epochs):
+                # print(f"epoch:{epoch}")
+                train_loss = self.train_one_epoch(graph, train_loader)  # logs
+
+                # if epoch % 5 ==0:
+                # valid_loss = self.validate(graph, bert_infer_loader, evaluator, split_idx, mode="valid")['valid_loss']
+                # logging.info(f"Seed: {self.args.seed}, Epoch: {epoch}, valid_loss: {valid_loss:.4f} | " + " | ".join([f"{k}: {v:.4f}" for k, v in logs.items()]))
+                # print(f"validate")
+                valid_loss = self.validate(graph, bert_infer_loader, evaluator, split_idx, mode="valid")
+                # logging.info(f"Seed: {self.args.seed}, Epoch: {epoch}, valid_loss: {valid_loss:.4f}")
+                print(f"log_sigma_text: {self.model.log_sigma_text.item()}, "
+                      f"log_sigma_graph: {self.model.log_sigma_graph.item()}, "
+                      f"log_sigma_fuse: {self.model.log_sigma_fuse.item()}")
+
+                if valid_loss < best_valid_loss:
+                    patience_counter = 0
+                    best_valid_loss = valid_loss
+                    wandb.log({"Epoch": epoch, "train_loss": train_loss, "valid_loss": valid_loss})
+                    # logging.info(
+                    #     f"Seed: {self.args.seed}, Epoch: {epoch}, train_loss: {train_loss:.4f}, valid_loss: {valid_loss:.4f}")
+                    save_checkpoint_scheduler(self.model, self.optimizer, epoch, valid_loss, self.args.checkpoint_path,
+                        scheduler=self.scheduler)
+                    self.best_model_state = copy.deepcopy(self.model.state_dict())
+                else:
+                    patience_counter += 1
+                if patience_counter >= self.args.patience:
+                    # logging.info(f"Early stopping at epoch {epoch}. Best best_valid_loss={best_valid_loss:.4f}")
+                    break
+                ## for ReduceLROnPlateau
+                # if self.scheduler is not None:
+                #     if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                #         self.scheduler.step(valid_loss)
+                #     else:
+                #         self.scheduler.step()
+                bar()
+
+            torch.save(self.best_model_state, str(self.args.best_model_save_path))
+
+    @torch.no_grad()
+    def validate(self, graph, bert_infer_loader, evaluator, split_idx, mode="valid"):
+        self.args.saveq=0
+        self.model.eval()
+        # with torch.no_grad():
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            node_id = graph.node_id.to(self.device)
+            x = graph.x.to(self.device)
+            edge_index = graph.edge_index.to(self.device)
+            y = graph.y.to(self.device)
+
+            graph_emb, text_emb, fuse_emb, fuse_logits, graph_logits, text_logits, ensemb_logits = self.model.inference(
+                self.device, node_id, x, edge_index, y, bert_infer_loader)
+            fuse_pred = torch.argmax(fuse_logits, dim=1)
+
+            split = split_idx[mode]
+            valid_fuse_acc, valid_fuse_rocauc, valid_fuse_f1 = evaluator.eval(y, fuse_pred, fuse_logits, split,
+                graph.num_classes)
+            # valid_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits[split], text_logits[split],
+            #     graph_logits[split], graph.y[split], text_emb[split], graph_emb[split], None, None, None, None, if_contrast_loss=False)
+            valid_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits[split],
+                text_logits[split], graph_logits[split], y[split], text_emb[split], graph_emb[split], None, None, None,
+                None, if_contrast_loss=False)
+            # metrics = {'valid_loss': valid_loss.item(), 'valid_acc': fuse_acc, 'valid_rocauc': fuse_rocauc,
+            #            'valid_f1': fuse_f1}
+            # split = split_idx['test']
+            # test_fuse_acc, test_fuse_rocauc, test_fuse_f1 = evaluator.eval(y, fuse_pred, fuse_logits, split,  graph.num_classes)
+            # logging.info(f"valid_fuse_acc: {valid_fuse_acc}, valid_fuse_rocauc: {valid_fuse_rocauc}, valid_fuse_f1: {valid_fuse_rocauc}, test_fuse_acc: {valid_fuse_rocauc}, test_fuse_rocauc: {valid_fuse_rocauc}, test_fuse_f1: {test_fuse_f1}.")
+            # return metrics
+
+            return valid_loss
+
+    @torch.no_grad()
+    def test(self, graph, bert_infer_loader, evaluator, split_idx, mode="test", ):
+        self.args.saveq=1
+
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+        # elif os.path.exists(self.args.best_model_save_path):
+        #     # self.model.load_state_dict(self.args.best_model_save_path)
+        #     try:
+        #         self.model.load_state_dict(torch.load(self.args.best_model_save_path, map_location=graph.y.device))
+        #     except ValueError:
+        #
+        #         print("Warning: No best_model_state found. Using current model parameters.")
+        else:
+            print("Warning: No best_model_state found. Using current model parameters.")
+        self.model.eval()
+        with torch.no_grad():
+            node_id = graph.node_id.to(self.device)
+            x = graph.x.to(self.device)
+            edge_index = graph.edge_index.to(self.device)
+            y = graph.y.to(self.device)
+            graph_emb, text_emb, fuse_emb, fuse_emb2, fuse_logits, graph_logits, text_logits, ensemb_logits, precomputed_neighbor_features, token_emb_all, graph_mask_outputs, attention_mask_all = self.model.inference_test(
+                self.device, node_id, x, edge_index, y, bert_infer_loader)
+            graph_pred = torch.argmax(graph_logits, dim=1)
+            text_pred = torch.argmax(text_logits, dim=1)
+            fuse_pred = torch.argmax(fuse_logits, dim=1)
+            ensemb_pred = torch.argmax(ensemb_logits, dim=1)
+
+            split = split_idx[mode]
+
+            graph_acc, graph_rocauc, graph_f1 = evaluator.eval(y, graph_pred, graph_logits, split, graph.num_classes)
+            text_acc, text_rocauc, text_f1 = evaluator.eval(y, text_pred, text_logits, split, graph.num_classes)
+            fuse_acc, fuse_rocauc, fuse_f1 = evaluator.eval(y, fuse_pred, fuse_logits, split, graph.num_classes)
+            ensemb_acc, ensemb_rocauc, ensemb_f1 = evaluator.eval(y, ensemb_pred, ensemb_logits, split,
+                graph.num_classes)
+            # precomputed_neighbor_features = precomputed_neighbor_features.to(graph.y.device)
+            # graph_mask_outputs = graph_mask_outputs.to(graph.y.device)
+            # attention_mask_all = attention_mask_all.to(y.device)
+
+            # total_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits, text_logits,
+            #     graph_logits, graph.y, text_emb, graph_emb, precomputed_neighbor_features, token_emb_all,
+            #     graph_mask_outputs, attention_mask_all, if_contrast_loss=True)
+
+            # total_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits, text_logits,
+            #     graph_logits, y, text_emb, graph_emb, precomputed_neighbor_features, token_emb_all, graph_mask_outputs,
+            #     attention_mask_all, if_contrast_loss=False)
+
+            # total_loss, fuse_loss, text_loss, graph_loss, contra_loss = None, None, None, None, None
+            metrics = {'graph': {'acc': graph_acc, 'rocauc': graph_rocauc, 'f1': graph_f1},
+                       'text': {'acc': text_acc, 'rocauc': text_rocauc, 'f1': text_f1},
+                       'fuse': {'acc': fuse_acc, 'rocauc': fuse_rocauc, 'f1': fuse_f1},
+                       'ensemb': {'acc': ensemb_acc, 'rocauc': ensemb_rocauc, 'f1': ensemb_f1}, }
+
+            # best_strategy
+            best_strategy = max(metrics.items(), key=lambda x: x[1]['acc'])[0]
+            best_metrics = metrics[best_strategy]
+            best_logits = {'graph': graph_logits, 'text': text_logits, 'fuse': fuse_logits, 'ensemb': ensemb_logits}[
+                best_strategy]
+            best_emb = {'graph': graph_emb, 'text': text_emb, 'fuse': fuse_emb2, 'ensemb': (graph_emb + text_emb) / 2}[
+                best_strategy]
+            best_preds = torch.argmax(best_logits, dim=-1)
+            torch.save({'embeddings': best_emb, 'logits': best_logits, 'predictions': best_preds, 'labels': y, },
+                self.args.best_emb_save_path)
+            plot_tsne(best_emb, y, self.args.best_emb_tsne_path, title=None, seed=self.args.seed, use_pca=False,
+                emb_type="umap")
+            # plot_tsne(fuse_emb2, graph.y, self.args.best_emb_tsne_path, title=None, seed=self.args.seed, use_pca=False,
+            #     emb_type="umap")
+            wandb.log({"test/best_acc": best_metrics['acc'], "test/best_f1": best_metrics['f1'],
+                       "test/best_rocauc": best_metrics['rocauc'], "test/strategy": best_strategy,
+                       "test/graph_acc": metrics['graph']['acc'], "test/text_acc": metrics['text']['acc'],
+                       "test/fuse_acc": metrics['fuse']['acc'], "test/ensemb_acc": metrics['ensemb']['acc'], })
+            return {'all_metrics': metrics, 'best_strategy': best_strategy, 'best_acc': best_metrics['acc'],
+                    'best_f1': best_metrics['f1'], 'best_rocauc': best_metrics['rocauc'], 'best_logits': best_logits,
+                    'best_emb': best_emb, }
