@@ -4,17 +4,16 @@ from datetime import datetime
 import numpy as np
 import seaborn as sns
 import torch
+from eval_tools import LRE
+from utils.plots import plot_tsne
+from wandb_wrapper import setup_wandb
 
 from data.load_data import get_main_dataloader, data_attributes
-from eval_tools import LRE
-from models.OTCL_unsupervised import OTCLUnsupervised
 from models.bert import load_pretrained_model_and_tokenizer_unspervised
 from trainer_unsupervised import Trainer_unsupervised
 from utils.arguments import args
 from utils.path_config import initialize_paths_all
-from utils.plots import plot_tsne
 from utils.util import init_random_state, use_best_hyperparams, get_linear_schedule_with_warmup, cleanup
-from wandb_wrapper import setup_wandb
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S',
     filename='main_unsupervised_otclout.log', filemode='a')
@@ -87,17 +86,18 @@ def main(args):
         np.abs(sns.utils.ci(sns.algorithms.bootstrap(values, func=np.mean, n_boot=1000), 95) - values.mean()))
 
     logging.info(f'args: {args}')
-    logging.info(f'dataset: {args.data_name}, test acc mean ± std = {test_acc_mean:.4f} ± {std:.4f}; test acc mean ± uncertainty = {test_acc_mean:.4f} ± {uncertainty:.4f}')
+    logging.info(
+        f'dataset: {args.data_name}, test acc mean ± std = {test_acc_mean:.4f} ± {std:.4f}; test acc mean ± uncertainty = {test_acc_mean:.4f} ± {uncertainty:.4f}')
 
 
 if __name__ == "__main__":
     # python run_unsupervised.py --data_name texas --gnn_name gcn --use_pe False --freeze_layers_count 0
     # python run_unsupervised.py --data_name cornell --gnn_name gcn --use_pe False --freeze_layers_count 0
     # python run_unsupervised.py --data_name Wisconsin --gnn_name gcn --use_pe False --freeze_layers_count 0
-    # python run_unsupervised.py --data_name cora --gnn_name gcn --use_pe False --batch_size 512 --accumulation_steps 4 --dropout 0 --freeze_layers_count 5
-    # python run_unsupervised.py --data_name Amazon --gnn_name gcn --use_pe False  --batch_size 64 --accumulation_steps 4 --dropout 0.3 --freeze_layers_count 1
-    # python run_unsupervised.py --data_name pubmed --gnn_name gcn --use_pe False  --batch_size 64 --accumulation_steps 4 --dropout 0.3 --freeze_layers_count 1
-    # python run_unsupervised.py --data_name Actor --gnn_name gcn --use_pe False  --batch_size 512 --accumulation_steps 4 --dropout 0.3 --freeze_layers_count 1
+    # python run_unsupervised.py --data_name cora --gnn_name gcn --use_pe False --batch_size 512 --patience 4 --dropout 0 --freeze_layers_count 5
+    # python run_unsupervised.py --data_name Amazon --gnn_name gcn --use_pe False  --batch_size 64 --patience 4 --dropout 0.3 --freeze_layers_count 1
+    # python run_unsupervised.py --data_name pubmed --gnn_name gcn --use_pe False  --batch_size 64 --patience 4 --dropout 0.3 --freeze_layers_count 1
+    # python run_unsupervised.py --data_name Actor --gnn_name gcn --use_pe False  --batch_size 512 --patience 4 --dropout 0.3 --freeze_layers_count 1
 
     args = use_best_hyperparams(args, args.dataset) if args.use_best_hyperparams else args
     return_dict = {"result": float("-inf")}

@@ -1,15 +1,16 @@
 import copy
-import gc
 import logging
 import os
 import sys
 
 import torch
 from alive_progress import alive_bar
-# from models.GNNNeighborExtractor import NeighborExtractor2, NeighborExtractor3, OptimizedNeighborExtractor
-from utils.plots import plot_tsne
-from utils.util import save_checkpoint_scheduler, time_logger, load_checkpoint_scheduler
 from wandb_wrapper import wandb
+
+# from models.GNNNeighborExtractor import NeighborExtractor2, NeighborExtractor3, OptimizedNeighborExtractor
+from utils.util import save_checkpoint_scheduler, time_logger, load_checkpoint_scheduler
+
+
 class OptimizedNeighborExtractor:
     def __init__(self, max_num_neighbors):
         self.max_num_neighbors = max_num_neighbors  # 每个节点最多的邻居数目
@@ -55,13 +56,14 @@ class OptimizedNeighborExtractor:
                     neighbor_mask[node, j] = 1  # 标记该位置为有效
                     break
 
+
 class Trainer_unsupervised:
     def __init__(self, model, optimizer, scheduler, args):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.args = args
-        self.accumulation_steps = args.accumulation_steps
+        self.patience = args.patience
         self.device = args.device
         self.best_model_state = None  # 用于保存最好模型的权重
         # self.neighbor_extractor = NeighborExtractor()
@@ -69,63 +71,35 @@ class Trainer_unsupervised:
 
         self.neighbor_extractor = OptimizedNeighborExtractor(max_num_neighbors=args.max_neighbors)
 
-    def train_one_epoch(self,  data_loader):
+    def train_one_epoch(self, data_loader):
         self.model.train()
         epoch_total_loss = 0.0
-        accumulation_steps = self.args.accumulation_steps  # Number of batches to accumulate gradients over
+        patience = self.args.patience  # Number of batches to accumulate gradients over
         self.optimizer.zero_grad()
 
         loss = torch.tensor(0.0)
         for batch_idx, batch in enumerate(data_loader):
             # print(batch)
-            for s in ["x", "y", "edge_index","input_ids","attention_mask"]:
+            for s in ["x", "y", "edge_index", "input_ids", "attention_mask"]:
                 batch[s] = batch[s].to(self.device)
             batch_size = batch['batch_size']
 
             # Forward pass
-            text_emb, graph_emb, fuse_emb, token_emb = self.model(
-                batch_size=batch_size, x=batch["x"], edge_index=batch["edge_index"],
-                text_input=batch["input_ids"][:batch_size], attention_mask=batch["attention_mask"][:batch_size]
-                )
-            # batch_neighbors_features：[batch_num_nodes, max_neighbors, num_node_features]
-            # batch_neighbors_mask：[batch_num_nodes, max_neighbors]
-            batch_neighbors_features, batch_neighbors_mask = self.neighbor_extractor.get_neighbor_tensor(
-                batch["edge_index"], graph_emb)
-            # print(batch_neighbors_features.shape, batch_neighbors_mask.shape)
-            # print("邻居特征 shape:", batch_neighbors_features.shape)
-            # print("掩码 shape:", batch_neighbors_mask.shape)
-            # exit(0)
-            loss = self.model.get_unsupervised_loss(
-                text_emb=text_emb,
-                token_emb=token_emb,
-                graph_emb=graph_emb,
-                batch_neighbors_features=batch_neighbors_features, # []
-                batch_neighbors_mask=batch_neighbors_mask,
+            text_emb, graph_emb, fuse_emb, token_emb = self.model(batch_size=batch_size, x=batch["x"],
+                edge_index=batch["edge_index"], text_input=batch["input_ids"][:batch_size],
                 attention_mask=batch["attention_mask"][:batch_size])
 
-            # conv = self.model.extractor.get_first_message_layer()
-            # batch_neighbors_features, batch_neighbors_mask = self.model.extractor.get_neighbor_tensor2(conv,
-            #     edge_index=batch["edge_index"])
-            # 打印结果
-            # print("邻居特征 shape:", batch_neighbors_features.shape)
-            # print("掩码 shape:", batch_neighbors_mask.shape)
-            # print(f"batch['edge_index'].size():{batch['edge_index'].size()}, batch['x'].size():{batch['x'].size()}")
-            #
-            # print(f"捕获的邻居特征:", len(self.neighbor_extractor.neighbor_features), self.neighbor_extractor.neighbor_features[0].shape)
-            # for i in range(len(self.neighbor_extractor.neighbor_features)):
-            #     print(f"捕获的邻居特征:", self.neighbor_extractor.neighbor_features[i].shape)
-            # loss = self.model.get_unsupervised_loss(
-            #     text_emb,
-            #     graph_emb,
-            #     batch.precomputed_neighbor_features[:batch_size].to(self.device),
-            #     token_emb,
-            #     batch.graph_mask_outputs[:batch_size].to(self.device),
-            #     batch["attention_mask"][:batch_size]
-            #     )
-            loss = loss / accumulation_steps
+            batch_neighbors_features, batch_neighbors_mask = self.neighbor_extractor.get_neighbor_tensor(
+                batch["edge_index"], graph_emb)
+
+            loss = self.model.get_unsupervised_loss(text_emb=text_emb, token_emb=token_emb, graph_emb=graph_emb,
+                batch_neighbors_features=batch_neighbors_features,  # []
+                batch_neighbors_mask=batch_neighbors_mask, attention_mask=batch["attention_mask"][:batch_size])
+
+            loss = loss / patience
             loss.backward()
 
-            if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(data_loader)):
+            if ((batch_idx + 1) % patience == 0) or (batch_idx + 1 == len(data_loader)):
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad()
@@ -141,7 +115,7 @@ class Trainer_unsupervised:
         start_epoch = 0
         patience_counter = 0
         best_loss = sys.float_info.max
-        self.args.saveq=0
+        self.args.saveq = 0
 
         # continue train
         if os.path.exists(self.args.checkpoint_path):
@@ -170,10 +144,6 @@ class Trainer_unsupervised:
                     # logging.info(f"Early stopping at epoch {epoch}. Best best_loss={best_loss:.4f}")
                     break
 
-                bar()
-                # print(f"Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-                # print(f"Memory reserved: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
-                # gc.collect()
-                # torch.cuda.empty_cache()
+                bar()  # print(f"Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")  # print(f"Memory reserved: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")  # gc.collect()  # torch.cuda.empty_cache()
 
             torch.save(self.best_model_state, str(self.args.best_model_save_path))

@@ -63,7 +63,7 @@ class Trainer:
         self.args = args
         self.patience = args.patience
         self.device = args.device
-        self.best_model_state = None  # 用于保存最好模型的权重
+        self.best_model_state = None
         self.neighbor_extractor = OptimizedNeighborExtractor(max_num_neighbors=args.max_neighbors)
 
     @time_logger
@@ -75,36 +75,32 @@ class Trainer:
         total_text_loss = 0
         total_graph_loss = 0
         total_contra_loss = 0
-        patience = self.args.patience  # Number of batches to accumulate gradients over
+        accumulation_steps = self.args.accumulation_steps  # Number of batches to accumulate gradients over
         self.optimizer.zero_grad()
         num_batches = len(train_loader)
         loss = torch.tensor(0.0)
-        # print(f"graph:{graph}")
         for batch_idx, batch in enumerate(train_loader):
             # print(f"batch_idx:{batch_idx}, batch:{batch}")
-            for s in ["x", "y", "edge_index", "input_ids", "attention_mask"]:
+            for s in ["x", "y", "edge_index", "input_ids", "attention_mask","batch_neighbors_features","batch_neighbors_mask"]:
                 batch[s] = batch[s].to(self.device)
             batch_size = batch['batch_size']
 
             fuse_logits, text_logits, graph_logits, logits_ensemb, text_emb, graph_emb, fuse_emb, fuse_emb2, token_emb = self.model(
                 batch_size=batch_size, x=batch["x"], edge_index=batch["edge_index"],
                 text_input=batch["input_ids"][:batch_size], attention_mask=batch["attention_mask"][:batch_size])
-            # print(batch)
-            batch_neighbors_features, batch_neighbors_mask = self.neighbor_extractor.get_neighbor_tensor(
-                batch["edge_index"], graph_emb)
 
             loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits, text_logits,
-                graph_logits, batch["y"][:batch_size], text_emb, graph_emb, batch_neighbors_features, token_emb,
-                batch_neighbors_mask, batch["attention_mask"][:batch_size])
+                graph_logits, batch["y"][:batch_size], text_emb, graph_emb, batch["batch_neighbors_features"][:batch_size], token_emb[:batch_size],
+                batch["batch_neighbors_mask"][:batch_size], batch["attention_mask"][:batch_size])
             # out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
             # y = batch.y[:batch.batch_size].squeeze()
             # loss = F.cross_entropy(out, y)
             # loss, fuse_loss, text_loss, graph_loss, contra_loss =  self.model.get_loss2(fuse_logits=fuse_logits, text_logits=text_logits, graph_logits=graph_logits, labels=batch.y[:batch_size], text_emb=text_emb, graph_emb=graph_emb, edge_index=batch.edge_index, token_emb=token_emb, attention_mask=batch["attention_mask"][:batch.batch_size], if_contrast_loss=True)
 
-            loss = loss / patience
+            loss = loss / accumulation_steps
             loss.backward()
 
-            if ((batch_idx + 1) % patience == 0) or (batch_idx + 1 == len(train_loader)):
+            if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(train_loader)):
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad()
@@ -127,58 +123,54 @@ class Trainer:
         start_epoch = 0
         patience_counter = 0
         best_valid_loss = sys.float_info.max
-        self.args.saveq = 0
+        self.args.saveq=0
 
+        # 加载 checkpoint
+        # if os.path.exists(self.args.checkpoint_path):
+        #     logging.info(f"Loading checkpoint from {self.args.checkpoint_path}")
+        #
+        #     # start_epoch, _, best_valid_loss = load_checkpoint_2(self.model, self.optimizer, None, self.args.checkpoint_path)
+        #     self.best_model_state = copy.deepcopy(self.model.state_dict())
+
+        # 继续训练
         if os.path.exists(self.args.checkpoint_path):
-            logging.info(f"Loading checkpoint from {self.args.checkpoint_path}")
-
-            # start_epoch, _, best_valid_loss = load_checkpoint_2(self.model, self.optimizer, None, self.args.checkpoint_path)
-            self.best_model_state = copy.deepcopy(self.model.state_dict())
-
-        if os.path.exists(self.args.checkpoint_path):
-            logging.info(
-                f"Loading checkpoint from {self.args.checkpoint_path}, start_epoch:{start_epoch}, best_valid_loss:{best_valid_loss}")
+            logging.info(f"Loading checkpoint from {self.args.checkpoint_path}, start_epoch:{start_epoch}, best_valid_loss:{best_valid_loss}")
             start_epoch, _, best_valid_loss = load_checkpoint_scheduler(self.model, self.optimizer, None,
                 self.args.checkpoint_path, scheduler=self.scheduler)
             self.best_model_state = copy.deepcopy(self.model.state_dict())
 
         with alive_bar(self.args.epochs) as bar:
             for epoch in range(start_epoch, self.args.epochs):
-                # print(f"epoch:{epoch}")
                 train_loss = self.train_one_epoch(graph, train_loader)  # logs
                 if epoch % 5 == 0:
                     valid_loss = self.validate(graph, bert_infer_loader, evaluator, split_idx, mode="valid")
-                if valid_loss < best_valid_loss:
-                    patience_counter = 0
-                    best_valid_loss = valid_loss
-                    save_checkpoint_scheduler(self.model, self.optimizer, epoch, valid_loss, self.args.checkpoint_path,
-                        scheduler=self.scheduler)
-                    self.best_model_state = copy.deepcopy(self.model.state_dict())
-                else:
-                    patience_counter += 1
-                if patience_counter >= self.args.patience:
-                    break
-                bar()
+                    if valid_loss < best_valid_loss:
+                        patience_counter = 0
+                        best_valid_loss = valid_loss
+                        save_checkpoint_scheduler(self.model, self.optimizer, epoch, valid_loss,
+                            self.args.checkpoint_path, scheduler=self.scheduler)
+                        self.best_model_state = copy.deepcopy(self.model.state_dict())
+                    else:
+                        patience_counter += 1
+                    if patience_counter >= self.args.patience:
+                        break
+                    bar()
             torch.save(self.best_model_state, str(self.args.best_model_save_path))
 
     @torch.no_grad()
     def validate(self, graph, bert_infer_loader, evaluator, split_idx, mode="valid"):
         self.args.saveq = 0
         self.model.eval()
-        # with torch.no_grad():
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             node_id = graph.node_id.to(self.device)
             x = graph.x.to(self.device)
             edge_index = graph.edge_index.to(self.device)
             y = graph.y.to(self.device)
-
             graph_emb, text_emb, fuse_emb, fuse_logits, graph_logits, text_logits, ensemb_logits = self.model.inference(
                 self.device, node_id, x, edge_index, y, bert_infer_loader)
             fuse_pred = torch.argmax(fuse_logits, dim=1)
 
             split = split_idx[mode]
-            valid_fuse_acc, valid_fuse_rocauc, valid_fuse_f1 = evaluator.eval(y, fuse_pred, fuse_logits, split,
-                graph.num_classes)
             valid_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits[split],
                 text_logits[split], graph_logits[split], y[split], text_emb[split], graph_emb[split], None, None, None,
                 None, if_contrast_loss=False)
@@ -193,10 +185,10 @@ class Trainer:
         # elif os.path.exists(self.args.best_model_save_path):
         #     # self.model.load_state_dict(self.args.best_model_save_path)
         #     try:
-        #         self.model.load_state_dict(torch.load(self.args.best_model_save_path, map_location=graph.y.device))
+        #         self.model.load_state_dict(torch.load(self.args.best_model_save_path, map_location=y.device))
         #     except ValueError:
         #
-        #         print("Warning: No best_model_state found. Using current model parameters.")
+        #         print("Warning: No best_model_state found. Using default model parameters.")
         else:
             print("Warning: No best_model_state found. Using current model parameters.")
         self.model.eval()
@@ -213,38 +205,11 @@ class Trainer:
             ensemb_pred = torch.argmax(ensemb_logits, dim=1)
 
             split = split_idx[mode]
-
             graph_acc, graph_rocauc, graph_f1 = evaluator.eval(y, graph_pred, graph_logits, split, graph.num_classes)
             text_acc, text_rocauc, text_f1 = evaluator.eval(y, text_pred, text_logits, split, graph.num_classes)
             fuse_acc, fuse_rocauc, fuse_f1 = evaluator.eval(y, fuse_pred, fuse_logits, split, graph.num_classes)
-            ensemb_acc, ensemb_rocauc, ensemb_f1 = evaluator.eval(y, ensemb_pred, ensemb_logits, split,
-                graph.num_classes)
-            # precomputed_neighbor_features = precomputed_neighbor_features.to(graph.y.device)
-            # graph_mask_outputs = graph_mask_outputs.to(graph.y.device)
-            # attention_mask_all = attention_mask_all.to(y.device)
-
-            # total_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits, text_logits,
-            #     graph_logits, graph.y, text_emb, graph_emb, precomputed_neighbor_features, token_emb_all,
-            #     graph_mask_outputs, attention_mask_all, if_contrast_loss=True)
-
-            # total_loss, fuse_loss, text_loss, graph_loss, contra_loss = self.model.get_loss(fuse_logits, text_logits,
-            #     graph_logits, y, text_emb, graph_emb, precomputed_neighbor_features, token_emb_all, graph_mask_outputs,
-            #     attention_mask_all, if_contrast_loss=False)
-
-            # total_loss, fuse_loss, text_loss, graph_loss, contra_loss = None, None, None, None, None
-            metrics = {'graph': {'acc': graph_acc, 'rocauc': graph_rocauc, 'f1': graph_f1},
-                       'text': {'acc': text_acc, 'rocauc': text_rocauc, 'f1': text_f1},
-                       'fuse': {'acc': fuse_acc, 'rocauc': fuse_rocauc, 'f1': fuse_f1},
-                       'ensemb': {'acc': ensemb_acc, 'rocauc': ensemb_rocauc, 'f1': ensemb_f1}, }
-
-            # best_strategy
+            ensemb_acc, ensemb_rocauc, ensemb_f1 = evaluator.eval(y, ensemb_pred, ensemb_logits, split, graph.num_classes)
+            metrics = {'graph': {'acc': graph_acc, 'rocauc': graph_rocauc, 'f1': graph_f1}, 'text': {'acc': text_acc, 'rocauc': text_rocauc, 'f1': text_f1}, 'fuse': {'acc': fuse_acc, 'rocauc': fuse_rocauc, 'f1': fuse_f1}, 'ensemb': {'acc': ensemb_acc, 'rocauc': ensemb_rocauc, 'f1': ensemb_f1}, }
             best_strategy = max(metrics.items(), key=lambda x: x[1]['acc'])[0]
             best_metrics = metrics[best_strategy]
-            best_logits = {'graph': graph_logits, 'text': text_logits, 'fuse': fuse_logits, 'ensemb': ensemb_logits}[
-                best_strategy]
-            best_emb = {'graph': graph_emb, 'text': text_emb, 'fuse': fuse_emb2, 'ensemb': (graph_emb + text_emb) / 2}[
-                best_strategy]
-            best_preds = torch.argmax(best_logits, dim=-1)
-            return {'all_metrics': metrics, 'best_strategy': best_strategy, 'best_acc': best_metrics['acc'],
-                    'best_f1': best_metrics['f1'], 'best_rocauc': best_metrics['rocauc'], 'best_logits': best_logits,
-                    'best_emb': best_emb, }
+            return {'all_metrics': metrics, 'best_acc': best_metrics['acc'], 'best_f1': best_metrics['f1'], 'best_rocauc': best_metrics['rocauc']}
