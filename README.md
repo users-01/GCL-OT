@@ -20,7 +20,7 @@ python run.py \
   --data_name texas \
   --gnn_name gcn \
   --bert_name distilbert \
-  --fuse_way add
+  --fuse_way concat
 ````
 
 All command-line flags are defined in `utils/arguments.py`, default hyper-parameters already reproduce the paper numbers.
